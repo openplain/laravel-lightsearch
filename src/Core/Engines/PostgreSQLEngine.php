@@ -1,0 +1,178 @@
+<?php
+
+namespace Ktr\LightSearch\Core\Engines;
+
+use Illuminate\Support\Facades\DB;
+
+class PostgreSQLEngine extends DatabaseEngine
+{
+    protected ?bool $hasTrgm = null;
+
+    /**
+     * Search using PostgreSQL's native text search capabilities.
+     * Uses ILIKE for case-insensitive prefix matching.
+     */
+    public function search(array $terms, string $model, int $limit = 10, int $offset = 0): array
+    {
+        $query = DB::table($this->table)
+            ->select('record_id', DB::raw('COUNT(*) as occurrences'))
+            ->where('model', $model)
+            ->where(function ($q) use ($terms) {
+                foreach ($terms as $term) {
+                    // PostgreSQL ILIKE is case-insensitive and optimized
+                    $q->orWhere('token', 'ilike', $term.'%');
+                }
+            })
+            ->groupBy('record_id')
+            ->orderByDesc('occurrences')
+            ->orderBy('record_id')  // Secondary sort for consistent ordering when scores are tied
+            ->offset($offset)
+            ->limit($limit);
+
+        return $query->pluck('record_id')->toArray();
+    }
+
+    /**
+     * Get total count of matching records.
+     */
+    public function count(array $terms, string $model): int
+    {
+        $subQuery = DB::table($this->table)
+            ->select('record_id')
+            ->where('model', $model)
+            ->where(function ($q) use ($terms) {
+                foreach ($terms as $term) {
+                    $q->orWhere('token', 'ilike', $term.'%');
+                }
+            })
+            ->groupBy('record_id');
+
+        return DB::table(DB::raw("({$subQuery->toSql()}) as search_results"))
+            ->mergeBindings($subQuery)
+            ->count();
+    }
+
+    /**
+     * Check if this engine supports fuzzy search.
+     */
+    public function supportsFuzzySearch(): bool
+    {
+        return $this->hasTrgmExtension();
+    }
+
+    /**
+     * Perform fuzzy search using PostgreSQL's pg_trgm extension.
+     * Falls back to regular prefix search if pg_trgm is not available.
+     *
+     * @param  float  $threshold  Similarity threshold (0.0 to 1.0)
+     */
+    public function fuzzySearch(array $terms, string $model, float $threshold = 0.3, int $limit = 10, int $offset = 0): array
+    {
+        if (!$this->hasTrgmExtension()) {
+            // Fallback to regular prefix search
+            return $this->search($terms, $model, $limit, $offset);
+        }
+
+        // Build CASE statements for each search term to score matching tokens
+        $caseStatements = [];
+        $selectBindings = [];
+
+        foreach ($terms as $term) {
+            // For each term, calculate its best similarity match across all tokens
+            $caseStatements[] = 'MAX(CASE WHEN similarity(token, ?) > ? THEN similarity(token, ?) ELSE 0 END)';
+            $selectBindings[] = $term;  // For similarity check
+            $selectBindings[] = $threshold;  // For threshold comparison
+            $selectBindings[] = $term;  // For similarity calculation
+        }
+
+        // Sum all the best matches for each term (rewards matching multiple terms)
+        $scoreExpression = '('.implode(' + ', $caseStatements).')';
+
+        // Build raw SQL to avoid binding issues
+        $pdo = DB::connection()->getPdo();
+
+        // Build WHERE conditions with bindings
+        $whereConditions = [];
+        $whereBindings = [];
+        foreach ($terms as $term) {
+            $whereConditions[] = 'similarity(token, ?) > ?';
+            $whereBindings[] = $term;
+            $whereBindings[] = $threshold;
+        }
+
+        // Construct the full query manually
+        $sql = sprintf(
+            'SELECT record_id FROM (
+                SELECT record_id, %s as total_score
+                FROM %s
+                WHERE model = ?
+                AND (%s)
+                GROUP BY record_id
+                HAVING %s > 0
+            ) as fuzzy_results
+            ORDER BY total_score DESC
+            LIMIT ? OFFSET ?',
+            $scoreExpression,
+            $this->table,
+            implode(' OR ', $whereConditions),
+            $scoreExpression  // Repeat expression in HAVING
+        );
+
+        // Combine all bindings in correct order
+        $allBindings = array_merge(
+            $selectBindings,  // For SELECT score calculation
+            [$model],  // For WHERE model =
+            $whereBindings,  // FOR WHERE similarity conditions
+            $selectBindings,  // For HAVING score calculation (repeat)
+            [$limit, $offset]  // For LIMIT and OFFSET
+        );
+
+        $results = DB::select($sql, $allBindings);
+
+        return array_column($results, 'record_id');
+    }
+
+    /**
+     * Get total count of fuzzy matching records.
+     */
+    public function fuzzyCount(array $terms, string $model, float $threshold = 0.3): int
+    {
+        if (!$this->hasTrgmExtension()) {
+            // Fallback to regular count
+            return $this->count($terms, $model);
+        }
+
+        $subQuery = DB::table($this->table)
+            ->select('record_id')
+            ->where('model', $model)
+            ->where(function ($q) use ($terms, $threshold) {
+                foreach ($terms as $term) {
+                    $q->orWhereRaw('similarity(token, ?) > ?', [$term, $threshold]);
+                }
+            })
+            ->groupBy('record_id');
+
+        return DB::table(DB::raw("({$subQuery->toSql()}) as search_results"))
+            ->mergeBindings($subQuery)
+            ->count();
+    }
+
+    /**
+     * Check if PostgreSQL has the pg_trgm extension installed.
+     */
+    protected function hasTrgmExtension(): bool
+    {
+        if ($this->hasTrgm !== null) {
+            return $this->hasTrgm;
+        }
+
+        try {
+            $result = DB::selectOne("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') as exists");
+            $this->hasTrgm = (bool) $result->exists;
+        } catch (\Exception $e) {
+            $this->hasTrgm = false;
+        }
+
+        return $this->hasTrgm;
+    }
+}

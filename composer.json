@@ -1,0 +1,63 @@
+{
+    "name": "openplain/laravel-lightsearch",
+    "description": "A lightweight Laravel Scout driver using database-backed search index. Perfect for small to medium datasets (1K-50K records) without external search services.",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Openplain",
+            "homepage": "https://openplain.dev"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "laravel/scout": "^9.0 || ^10.0 || ^11.0",
+        "illuminate/support": "^10.0 || ^11.0 || ^12.0",
+        "illuminate/database": "^10.0 || ^11.0 || ^12.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0 || ^11.0",
+        "orchestra/testbench": "^8.0 || ^9.0",
+        "laravel/pint": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ktr\\LightSearch\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ktr\\LightSearch\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Ktr\\LightSearch\\LightSearchServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit",
+        "format": "vendor/bin/pint"
+    },
+    "keywords": [
+        "laravel",
+        "laravel-scout",
+        "scout",
+        "lightsearch",
+        "search",
+        "database",
+        "lightweight",
+        "openplain",
+        "fulltext",
+        "index"
+    ],
+    "homepage": "https://github.com/openplain/laravel-lightsearch",
+    "support": {
+        "issues": "https://github.com/openplain/laravel-lightsearch/issues",
+        "source": "https://github.com/openplain/laravel-lightsearch"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

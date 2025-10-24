@@ -65,12 +65,13 @@ class PostgreSQLEngine extends DatabaseEngine
      * Falls back to regular prefix search if pg_trgm is not available.
      *
      * @param  float  $threshold  Similarity threshold (0.0 to 1.0)
+     * @return array Array with 'ids' and 'total' keys
      */
     public function fuzzySearch(array $terms, string $model, float $threshold = 0.3, int $limit = 10, int $offset = 0): array
     {
         if (!$this->hasTrgmExtension()) {
             // Fallback to regular prefix search
-            return $this->search($terms, $model, $limit, $offset);
+            return ['ids' => $this->search($terms, $model, $limit, $offset), 'total' => null];
         }
 
         // Build CASE statements for each search term to score matching tokens
@@ -88,9 +89,6 @@ class PostgreSQLEngine extends DatabaseEngine
         // Sum all the best matches for each term (rewards matching multiple terms)
         $scoreExpression = '('.implode(' + ', $caseStatements).')';
 
-        // Build raw SQL to avoid binding issues
-        $pdo = DB::connection()->getPdo();
-
         // Build WHERE conditions with bindings
         $whereConditions = [];
         $whereBindings = [];
@@ -100,19 +98,23 @@ class PostgreSQLEngine extends DatabaseEngine
             $whereBindings[] = $threshold;
         }
 
-        // Construct the full query manually
+        // Use COUNT(*) OVER() window function to get total count in same query
+        // This eliminates the need for a separate count query
         $sql = sprintf(
-            'SELECT record_id FROM (
-                SELECT record_id, %s as total_score
-                FROM %s
-                WHERE model = ?
-                AND (%s)
-                GROUP BY record_id
-                HAVING %s > 0
+            'SELECT record_id, total_score, total_count FROM (
+                SELECT record_id, total_score, COUNT(*) OVER() as total_count
+                FROM (
+                    SELECT record_id, %s as total_score
+                    FROM %s
+                    WHERE model = ?
+                    AND (%s)
+                    GROUP BY record_id
+                    HAVING %s > 0
+                ) as scored_results
             ) as fuzzy_results
             ORDER BY total_score DESC
             LIMIT ? OFFSET ?',
-            $scoreExpression,
+            $scoreExpression,  // For inner SELECT scoring
             $this->table,
             implode(' OR ', $whereConditions),
             $scoreExpression  // Repeat expression in HAVING
@@ -120,7 +122,7 @@ class PostgreSQLEngine extends DatabaseEngine
 
         // Combine all bindings in correct order
         $allBindings = array_merge(
-            $selectBindings,  // For SELECT score calculation
+            $selectBindings,  // For inner SELECT score calculation
             [$model],  // For WHERE model =
             $whereBindings,  // FOR WHERE similarity conditions
             $selectBindings,  // For HAVING score calculation (repeat)
@@ -129,7 +131,10 @@ class PostgreSQLEngine extends DatabaseEngine
 
         $results = DB::select($sql, $allBindings);
 
-        return array_column($results, 'record_id');
+        return [
+            'ids' => array_column($results, 'record_id'),
+            'total' => !empty($results) ? (int) $results[0]->total_count : 0,
+        ];
     }
 
     /**
@@ -159,6 +164,7 @@ class PostgreSQLEngine extends DatabaseEngine
 
     /**
      * Check if PostgreSQL has the pg_trgm extension installed.
+     * Result is cached indefinitely to avoid repeated database queries.
      */
     protected function hasTrgmExtension(): bool
     {
@@ -166,12 +172,20 @@ class PostgreSQLEngine extends DatabaseEngine
             return $this->hasTrgm;
         }
 
-        try {
-            $result = DB::selectOne("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') as exists");
-            $this->hasTrgm = (bool) $result->exists;
-        } catch (\Exception $e) {
-            $this->hasTrgm = false;
-        }
+        // Use Laravel's cache to persist the result across requests
+        // Cache key includes connection name to support multiple databases
+        $connectionName = DB::connection()->getName();
+        $cacheKey = "lightsearch_pgtrgm_{$connectionName}";
+
+        $this->hasTrgm = \Illuminate\Support\Facades\Cache::rememberForever($cacheKey, function () {
+            try {
+                $result = DB::selectOne("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') as exists");
+
+                return (bool) $result->exists;
+            } catch (\Exception $e) {
+                return false;
+            }
+        });
 
         return $this->hasTrgm;
     }

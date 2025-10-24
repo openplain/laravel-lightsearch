@@ -147,10 +147,11 @@ class LightSearchEngine extends Engine
         $threshold = $builder->options['fuzzy_threshold'] ?? 0.3;
 
         // Automatically use fuzzy search if the engine supports it
-        // The engine will fall back to prefix search if fuzzy is not available
+        // PostgreSQL fuzzy search returns both IDs and total count in one query
         if ($this->engine->supportsFuzzySearch()) {
-            $ids = $this->engine->fuzzySearch($terms, $model, $threshold, $limit, $offset);
-            $total = $this->engine->fuzzyCount($terms, $model, $threshold);
+            $result = $this->engine->fuzzySearch($terms, $model, $threshold, $limit, $offset);
+            $ids = $result['ids'] ?? [];
+            $total = $result['total'] ?? $this->engine->fuzzyCount($terms, $model, $threshold);
         } else {
             $ids = $this->engine->search($terms, $model, $limit, $offset);
             $total = $this->engine->count($terms, $model);

@@ -74,67 +74,79 @@ class PostgreSQLEngine extends DatabaseEngine
             return ['ids' => $this->search($terms, $model, $limit, $offset), 'total' => null];
         }
 
-        // Build CASE statements for each search term to score matching tokens
-        $caseStatements = [];
-        $selectBindings = [];
+        try {
+            // Build CASE statements for each search term to score matching tokens
+            $caseStatements = [];
+            $selectBindings = [];
 
-        foreach ($terms as $term) {
-            // For each term, calculate its best similarity match across all tokens
-            $caseStatements[] = 'MAX(CASE WHEN similarity(token, ?) > ? THEN similarity(token, ?) ELSE 0 END)';
-            $selectBindings[] = $term;  // For similarity check
-            $selectBindings[] = $threshold;  // For threshold comparison
-            $selectBindings[] = $term;  // For similarity calculation
+            foreach ($terms as $term) {
+                // For each term, calculate its best similarity match across all tokens
+                $caseStatements[] = 'MAX(CASE WHEN similarity(token, ?) > ? THEN similarity(token, ?) ELSE 0 END)';
+                $selectBindings[] = $term;  // For similarity check
+                $selectBindings[] = $threshold;  // For threshold comparison
+                $selectBindings[] = $term;  // For similarity calculation
+            }
+
+            // Sum all the best matches for each term (rewards matching multiple terms)
+            $scoreExpression = '('.implode(' + ', $caseStatements).')';
+
+            // Build WHERE conditions with bindings
+            $whereConditions = [];
+            $whereBindings = [];
+            foreach ($terms as $term) {
+                $whereConditions[] = 'similarity(token, ?) > ?';
+                $whereBindings[] = $term;
+                $whereBindings[] = $threshold;
+            }
+
+            // Use COUNT(*) OVER() window function to get total count in same query
+            // This eliminates the need for a separate count query
+            $sql = sprintf(
+                'SELECT record_id, total_score, total_count FROM (
+                    SELECT record_id, total_score, COUNT(*) OVER() as total_count
+                    FROM (
+                        SELECT record_id, %s as total_score
+                        FROM %s
+                        WHERE model = ?
+                        AND (%s)
+                        GROUP BY record_id
+                        HAVING %s > 0
+                    ) as scored_results
+                ) as fuzzy_results
+                ORDER BY total_score DESC
+                LIMIT ? OFFSET ?',
+                $scoreExpression,  // For inner SELECT scoring
+                $this->table,
+                implode(' OR ', $whereConditions),
+                $scoreExpression  // Repeat expression in HAVING
+            );
+
+            // Combine all bindings in correct order
+            $allBindings = array_merge(
+                $selectBindings,  // For inner SELECT score calculation
+                [$model],  // For WHERE model =
+                $whereBindings,  // FOR WHERE similarity conditions
+                $selectBindings,  // For HAVING score calculation (repeat)
+                [$limit, $offset]  // For LIMIT and OFFSET
+            );
+
+            $results = DB::select($sql, $allBindings);
+
+            return [
+                'ids' => array_column($results, 'record_id'),
+                'total' => !empty($results) ? (int) $results[0]->total_count : 0,
+            ];
+        } catch (\Exception $e) {
+            // If similarity() function fails, the extension was likely disabled
+            // Clear the stale cache and fall back to regular search
+            if (str_contains($e->getMessage(), 'similarity')) {
+                $this->clearTrgmCache();
+                $this->hasTrgm = false;
+            }
+
+            // Fall back to regular prefix search
+            return ['ids' => $this->search($terms, $model, $limit, $offset), 'total' => null];
         }
-
-        // Sum all the best matches for each term (rewards matching multiple terms)
-        $scoreExpression = '('.implode(' + ', $caseStatements).')';
-
-        // Build WHERE conditions with bindings
-        $whereConditions = [];
-        $whereBindings = [];
-        foreach ($terms as $term) {
-            $whereConditions[] = 'similarity(token, ?) > ?';
-            $whereBindings[] = $term;
-            $whereBindings[] = $threshold;
-        }
-
-        // Use COUNT(*) OVER() window function to get total count in same query
-        // This eliminates the need for a separate count query
-        $sql = sprintf(
-            'SELECT record_id, total_score, total_count FROM (
-                SELECT record_id, total_score, COUNT(*) OVER() as total_count
-                FROM (
-                    SELECT record_id, %s as total_score
-                    FROM %s
-                    WHERE model = ?
-                    AND (%s)
-                    GROUP BY record_id
-                    HAVING %s > 0
-                ) as scored_results
-            ) as fuzzy_results
-            ORDER BY total_score DESC
-            LIMIT ? OFFSET ?',
-            $scoreExpression,  // For inner SELECT scoring
-            $this->table,
-            implode(' OR ', $whereConditions),
-            $scoreExpression  // Repeat expression in HAVING
-        );
-
-        // Combine all bindings in correct order
-        $allBindings = array_merge(
-            $selectBindings,  // For inner SELECT score calculation
-            [$model],  // For WHERE model =
-            $whereBindings,  // FOR WHERE similarity conditions
-            $selectBindings,  // For HAVING score calculation (repeat)
-            [$limit, $offset]  // For LIMIT and OFFSET
-        );
-
-        $results = DB::select($sql, $allBindings);
-
-        return [
-            'ids' => array_column($results, 'record_id'),
-            'total' => !empty($results) ? (int) $results[0]->total_count : 0,
-        ];
     }
 
     /**
@@ -147,19 +159,31 @@ class PostgreSQLEngine extends DatabaseEngine
             return $this->count($terms, $model);
         }
 
-        $subQuery = DB::table($this->table)
-            ->select('record_id')
-            ->where('model', $model)
-            ->where(function ($q) use ($terms, $threshold) {
-                foreach ($terms as $term) {
-                    $q->orWhereRaw('similarity(token, ?) > ?', [$term, $threshold]);
-                }
-            })
-            ->groupBy('record_id');
+        try {
+            $subQuery = DB::table($this->table)
+                ->select('record_id')
+                ->where('model', $model)
+                ->where(function ($q) use ($terms, $threshold) {
+                    foreach ($terms as $term) {
+                        $q->orWhereRaw('similarity(token, ?) > ?', [$term, $threshold]);
+                    }
+                })
+                ->groupBy('record_id');
 
-        return DB::table(DB::raw("({$subQuery->toSql()}) as search_results"))
-            ->mergeBindings($subQuery)
-            ->count();
+            return DB::table(DB::raw("({$subQuery->toSql()}) as search_results"))
+                ->mergeBindings($subQuery)
+                ->count();
+        } catch (\Exception $e) {
+            // If similarity() function fails, the extension was likely disabled
+            // Clear the stale cache and fall back to regular count
+            if (str_contains($e->getMessage(), 'similarity')) {
+                $this->clearTrgmCache();
+                $this->hasTrgm = false;
+            }
+
+            // Fall back to regular count
+            return $this->count($terms, $model);
+        }
     }
 
     /**
@@ -188,5 +212,16 @@ class PostgreSQLEngine extends DatabaseEngine
         });
 
         return $this->hasTrgm;
+    }
+
+    /**
+     * Clear the cached pg_trgm extension check.
+     * Useful when the extension is installed/uninstalled at runtime.
+     */
+    protected function clearTrgmCache(): void
+    {
+        $connectionName = DB::connection()->getName();
+        $cacheKey = "lightsearch_pgtrgm_{$connectionName}";
+        \Illuminate\Support\Facades\Cache::forget($cacheKey);
     }
 }
